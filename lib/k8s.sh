@@ -2,88 +2,78 @@
 
 #######################################
 # Kubernetes interactions
-# Used by: main script
-#######################################
-
-#######################################
-# Fetch pod JSON from Kubernetes
-# Arguments:
-#   $1 - pod name
-#   $2 - namespace
-# Returns:
-#   Pod JSON on success
-#   Exits with error on failure
 #######################################
 
 fetch_pod() {
     local pod="$1"
-    local namespace="$2"
-    local pod_json
-    local error_output
+    local ns="$2"
+    local out
     
-    log_info "Fetching pod '$pod' from namespace '$namespace'..."
-    
-    # Try to get pod JSON
-    # Capture both stdout and stderr
-    if ! pod_json=$(kubectl get pod "$pod" -n "$namespace" -o json 2>/dev/null); then
-        log_error "Failed to get pod '$pod' in namespace '$namespace'"
-        echo ""
-        echo "kubectl output:"
-        echo "$pod_json"
-        echo ""
-        echo "Troubleshooting:"
-        echo "  1. Check if pod exists:"
-        echo "     kubectl get pods -n $namespace"
-        echo ""
-        echo "  2. Check if namespace exists:"
-        echo "     kubectl get namespaces | grep $namespace"
-        echo ""
-        echo "  3. Check cluster connection:"
-        echo "     kubectl cluster-info"
+    log_info "Fetching metadata for '$pod'..."
+    if ! out=$(kubectl get pod "$pod" -n "$ns" -o json 2>/dev/null); then
+        log_error "Pod not found or access denied."
         exit 1
     fi
-    
-    log_success "Pod fetched successfully"
-    
-    # Return JSON
-    echo "$pod_json"
+    echo "$out"
 }
 
-#######################################
-# Extract pod status fields
-# Arguments:
-#   $1 - pod JSON
-# Sets global variables:
-#   PHASE - pod phase
-#   REASON - pod-level reason (Evicted, etc.) or "Unknown"
-#   CRASH_DETAILS - multi-line list of container/init failures (reason, exit code, message)
-#######################################
+# Fetch Warning events related to the pod
+fetch_events() {
+    local pod="$1"
+    local ns="$2"
+    
+    # Get events, filter for Warnings, sort by time, take last 5
+    kubectl get events -n "$ns" \
+        --field-selector involvedObject.name="$pod",type=Warning \
+        --sort-by='.lastTimestamp' \
+        -o custom-columns=TIME:.lastTimestamp,MESSAGE:.message \
+        | tail -n 5 || true
+}
 
-extract_pod_status() {
-    local pod_json="$1"
-    
-    # Extract phase
-    PHASE=$(echo "$pod_json" | jq -r '.status.phase // "Unknown"')
-    
-    # Pod-level reason (set only in cases like Evicted, NodeAffinity, etc.)
-    REASON=$(echo "$pod_json" | jq -r '.status.reason // "Unknown"')
-    
-    # Container-level crash details: terminated, waiting (CrashLoopBackOff → lastState), waiting only
-    CRASH_DETAILS=$(echo "$pod_json" | jq -r '
-        def line(r; code; msg; suffix):
-            (r // "?") +
-            (if code != null then " (exit " + (code | tostring) + ")" else "" end) +
-            (if (msg // "") | length > 0 then " — " + msg else "" end) +
-            (if (suffix // "") | length > 0 then " [" + suffix + "]" else "" end);
-        def add(t; n; r; code; msg; suffix): (t + " \"" + n + "\": " + line(r; code; msg; suffix));
-        [
-            (.status.initContainerStatuses[]? | {t: "Init container", n: .name, term: .state.terminated, wait: .state.waiting, last: .lastState.terminated}),
-            (.status.containerStatuses[]? | {t: "Container", n: .name, term: .state.terminated, wait: .state.waiting, last: .lastState.terminated})
-        ] | map(
-            if .term then add(.t; .n; .term.reason; .term.exitCode; .term.message; null)
-            elif .wait != null and .last != null then add(.t; .n; .last.reason; .last.exitCode; .last.message; .wait.reason)
-            elif .wait != null then add(.t; .n; .wait.reason; null; .wait.message; null)
-            else empty end
-        ) | .[]
+# Fetch logs intelligently (current or previous instance)
+fetch_logs() {
+    local pod="$1"
+    local ns="$2"
+    local container="$3"
+    local use_previous="$4"
+    local lines="$5"
+
+    local opts="--tail=$lines"
+    if [[ "$use_previous" == "true" ]]; then
+        opts="$opts --previous"
+        echo -e "${YELLOW}(Showing logs from PREVIOUS crashed instance)${NC}"
+    else
+        echo -e "${GREEN}(Showing logs from terminated container)${NC}"
+    fi
+
+    kubectl logs "$pod" -n "$ns" -c "$container" $opts 2>&1 || echo "No logs found."
+}
+
+# Analyze pod and extract actionable data
+analyze_pod() {
+    local json="$1"
+
+    # Basic Info
+    PHASE=$(echo "$json" | jq -r '.status.phase // "Unknown"')
+    REASON=$(echo "$json" | jq -r '.status.reason // "None"')
+    START_TIME=$(echo "$json" | jq -r '.status.startTime // "Unknown"')
+
+    # Find the "worst" container (the one causing the crash)
+    # We construct a JSON object describing the bad container and print it compact (-c)
+    BAD_CONTAINER_INFO=$(echo "$json" | jq -c '
+        ([.status.initContainerStatuses[]?], [.status.containerStatuses[]?]) | flatten | 
+        map(select(. != null)) | 
+        map(
+            if .state.terminated.exitCode != 0 and .state.terminated.exitCode != null then
+                {name: .name, state: "terminated", reason: .state.terminated.reason, code: .state.terminated.exitCode, msg: .state.terminated.message, is_bad: true, use_prev: false}
+            elif .lastState.terminated.exitCode != 0 and .lastState.terminated.exitCode != null then
+                {name: .name, state: "crashloop", reason: .lastState.terminated.reason, code: .lastState.terminated.exitCode, msg: .lastState.terminated.message, is_bad: true, use_prev: true}
+            elif .state.waiting.reason == "ImagePullBackOff" or .state.waiting.reason == "ErrImagePull" or .state.waiting.reason == "CrashLoopBackOff" then
+                {name: .name, state: "waiting", reason: .state.waiting.reason, code: 0, msg: .state.waiting.message, is_bad: true, use_prev: false}
+            else
+                {name: .name, is_bad: false}
+            end
+        ) | 
+        sort_by(.is_bad) | reverse | .[0]
     ')
 }
